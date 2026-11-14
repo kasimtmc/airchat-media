@@ -1,0 +1,13 @@
+[package]
+name = "airchat-media"
+description = "Calls, push-to-talk and video for AirChat and AirChat+: the call logic over link records (protocol §8.5, §8.6, §9.6, §9.9) and the jitter buffer"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/kasimtmc/airchat-media"
+publish = false
+
+[dependencies]
+airchat-protocol = { git = "https://github.com/kasimtmc/airchat-protocol", tag = "v0.5.1" }
+thiserror = "2.0.21"
+zeroize = { version = "1.9.1", features = ["derive"] }
