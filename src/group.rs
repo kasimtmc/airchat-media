@@ -497,7 +497,12 @@ impl Media {
                             }
                             return effects;
                         }
-                        effects
+                        // Linked already, as everyone is through a room (§17.2) where all hear
+                        // all: a newcomer there hears of this device, and of nobody else.
+                        match call.presence().filter(|_| call.joined) {
+                            Some(presence) => effects.send(contact, presence),
+                            None => effects,
+                        }
                     }
                     Some(_) => effects,
                     None => {
@@ -533,6 +538,20 @@ impl Media {
             return Effects::default();
         }
         self.call_over_check(reason)
+    }
+
+    /// `member` left group call `id` through a room (§17.2), whose leave names nobody: the node
+    /// knows who sent it. The room stays linked for the others.
+    pub fn member_left(&mut self, id: StreamId, member: ContactId) -> Effects {
+        let Some(call) = self.group_call.as_mut().filter(|c| c.id == id) else {
+            return Effects::default();
+        };
+        let Some(origin) = call.origin_of(member) else {
+            return Effects::default();
+        };
+        call.heard.remove(&origin);
+        call.lost.remove(&member);
+        self.call_over_check(EndReason::HungUp)
     }
 
     /// Ends the group call here if everyone else in it has gone (and nobody gone without leaving
@@ -1318,6 +1337,72 @@ mod tests {
             "Cem is left alone: over"
         );
         assert!(d.iter().all(|m| m.group_call().is_none()));
+    }
+
+    /// A room passes each record to everyone else in it: it is the one link of each device.
+    fn deliver_in_room(devices: &mut [Media; 3], inside: &[usize], from: usize, effects: Effects) -> Vec<Vec<Event>> {
+        const ROOM: ContactId = 9;
+        let mut shown: Vec<Vec<Event>> = vec![Vec::new(), Vec::new(), Vec::new()];
+        let mut queue: Vec<(usize, ChatMessage)> = effects.send.into_iter().map(|(_, m)| (from, m)).collect();
+        while !queue.is_empty() {
+            let (sender, message) = queue.remove(0);
+            for &at in inside.iter().filter(|&&at| at != sender) {
+                let effects = match message.clone() {
+                    m @ (ChatMessage::GroupCall { .. } | ChatMessage::GroupCallLeave { .. }) => {
+                        devices[at].receive_group(ROOM, m, SILENT)
+                    }
+                    m @ ChatMessage::CallPresence { member, .. } => {
+                        devices[at].receive_call_presence(ROOM, member.as_bytes()[0] as ContactId, m)
+                    }
+                    m @ ChatMessage::CallAudio { .. } => devices[at].receive_call_audio(ROOM, m),
+                    _ => continue,
+                };
+                queue.extend(effects.send.into_iter().map(|(_, m)| (at, m)));
+                shown[at].extend(effects.actions);
+            }
+        }
+        shown
+    }
+
+    #[test]
+    fn in_a_room_a_late_joiner_hears_of_everyone_at_once() {
+        const ROOM: ContactId = 9;
+        let mut d = devices();
+        let id = [8; 16];
+        let start = d[0].start_group_call(GROUP, ROW, id, &[ROOM], me(0)).unwrap();
+        deliver_in_room(&mut d, &[0, 1, 2], 0, start);
+        let join = d[1].join_group_call(id, &[ROOM], me(1)).unwrap();
+        deliver_in_room(&mut d, &[0, 1], 1, join);
+        let join = d[2].join_group_call(id, &[ROOM], me(2)).unwrap();
+        let shown = deliver_in_room(&mut d, &[0, 1, 2], 2, join);
+        assert!(
+            matches!(shown[2].last(), Some(Event::GroupCallChanged { participants, .. }) if participants.len() == 2),
+            "Cem hears of both before anyone's next presence"
+        );
+        for speaker in [0, 1] {
+            let audio = d[speaker].audio(id, b"opus");
+            assert_eq!(audio.len(), 1, "one record, for the room");
+            let shown = deliver_in_room(
+                &mut d,
+                &[0, 1, 2],
+                speaker,
+                Effects {
+                    send: audio,
+                    actions: Vec::new(),
+                },
+            );
+            assert!(matches!(shown[2][..], [Event::Audio { .. }]), "Cem hears {speaker}");
+            assert!(shown[speaker].is_empty(), "nothing comes back");
+        }
+        // Cem leaves: the room's leave names nobody, so the node says who it was.
+        assert!(matches!(
+            d[2].hang_up(id).send[..],
+            [(ROOM, ChatMessage::GroupCallLeave { .. })]
+        ));
+        let gone = d[0].member_left(id, 3);
+        assert!(matches!(&gone.actions[..], [Event::GroupCallChanged { participants, .. }] if participants == &[2]));
+        assert_eq!(d[0].audio(id, b"x").len(), 1, "the room still takes Ayşe's audio");
+        assert!(matches!(d[0].member_left(id, 2).actions[..], [Event::CallEnded { .. }]));
     }
 
     #[test]
